@@ -1,0 +1,6 @@
+#secondaryOpenFile {
+  display: none;
+}
+#editorFreeText, #editorInk, #editorStamp {
+  display: none;
+}
