@@ -612,7 +612,7 @@ const PDFViewerApplication = {
 
     const { appConfig, eventBus } = this;
     let file;
-    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
+    if (false) { // Disable loading files from the URL
       const queryString = document.location.search.substring(1);
       const params = parseQueryString(queryString);
       file = params.get("file") ?? AppOptions.get("defaultUrl");
@@ -623,7 +623,7 @@ const PDFViewerApplication = {
       file = AppOptions.get("defaultUrl");
     }
 
-    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
+    if (false) { // Disable loading files via the file input or drag-and-drop
       const fileInput = (this._openFileInput = document.createElement("input"));
       fileInput.id = "fileInput";
       fileInput.hidden = true;
