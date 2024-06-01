@@ -124,6 +124,15 @@ function getSelector(id) {
   return `[data-element-id="${id}"]`;
 }
 
+async function getRect(page, selector) {
+  // In Chrome something is wrong when serializing a `DomRect`,
+  // so we extract the values and return them ourselves.
+  return page.$eval(selector, el => {
+    const { x, y, width, height } = el.getBoundingClientRect();
+    return { x, y, width, height };
+  });
+}
+
 function getQuerySelector(id) {
   return `document.querySelector('${getSelector(id)}')`;
 }
@@ -146,6 +155,27 @@ function getSelectedEditors(page) {
     results.sort();
     return results;
   });
+}
+
+async function getSpanRectFromText(page, pageNumber, text) {
+  await page.waitForSelector(
+    `.page[data-page-number="${pageNumber}"] > .textLayer .endOfContent`
+  );
+  return page.evaluate(
+    (number, content) => {
+      for (const el of document.querySelectorAll(
+        `.page[data-page-number="${number}"] > .textLayer > span`
+      )) {
+        if (el.textContent === content) {
+          const { x, y, width, height } = el.getBoundingClientRect();
+          return { x, y, width, height };
+        }
+      }
+      return null;
+    },
+    pageNumber,
+    text
+  );
 }
 
 async function waitForEvent(page, eventName, timeout = 5000) {
@@ -291,16 +321,18 @@ function getAnnotationStorage(page) {
   );
 }
 
-function waitForEntryInStorage(page, key, value) {
+function waitForEntryInStorage(page, key, value, checker = (x, y) => x === y) {
   return page.waitForFunction(
-    (k, v) => {
+    (k, v, c) => {
       const { map } =
         window.PDFViewerApplication.pdfDocument.annotationStorage.serializable;
-      return map && JSON.stringify(map.get(k)) === v;
+      // eslint-disable-next-line no-eval
+      return map && eval(`(${c})`)(JSON.stringify(map.get(k)), v);
     },
     {},
     key,
-    JSON.stringify(value)
+    JSON.stringify(value),
+    checker.toString()
   );
 }
 
@@ -404,10 +436,7 @@ async function firstPageOnTop(page) {
 }
 
 async function hover(page, selector) {
-  const rect = await page.$eval(selector, el => {
-    const { x, y, width, height } = el.getBoundingClientRect();
-    return { x, y, width, height };
-  });
+  const rect = await getRect(page, selector);
   await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2);
 }
 
@@ -552,6 +581,23 @@ async function kbFocusPrevious(page) {
   await awaitPromise(handle);
 }
 
+async function switchToEditor(name, page, disable = false) {
+  const modeChangedHandle = await createPromise(page, resolve => {
+    window.PDFViewerApplication.eventBus.on(
+      "annotationeditormodechanged",
+      resolve,
+      { once: true }
+    );
+  });
+  await page.click(`#editor${name}`);
+  name = name.toLowerCase();
+  await page.waitForSelector(
+    ".annotationEditorLayer" +
+      (disable ? `:not(.${name}Editing)` : `.${name}Editing`)
+  );
+  await awaitPromise(modeChangedHandle);
+}
+
 export {
   awaitPromise,
   clearInput,
@@ -566,9 +612,11 @@ export {
   getEditorSelector,
   getFirstSerialized,
   getQuerySelector,
+  getRect,
   getSelectedEditors,
   getSelector,
   getSerialized,
+  getSpanRectFromText,
   hover,
   kbBigMoveDown,
   kbBigMoveLeft,
@@ -591,6 +639,7 @@ export {
   pasteFromClipboard,
   scrollIntoView,
   serializeBitmapDimensions,
+  switchToEditor,
   waitForAnnotationEditorLayer,
   waitForEntryInStorage,
   waitForEvent,

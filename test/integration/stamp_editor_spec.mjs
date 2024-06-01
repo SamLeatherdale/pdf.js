@@ -19,6 +19,7 @@ import {
   getEditorDimensions,
   getEditorSelector,
   getFirstSerialized,
+  getRect,
   kbBigMoveDown,
   kbBigMoveRight,
   kbCopy,
@@ -29,7 +30,9 @@ import {
   pasteFromClipboard,
   scrollIntoView,
   serializeBitmapDimensions,
+  switchToEditor,
   waitForAnnotationEditorLayer,
+  waitForEntryInStorage,
   waitForSelectedEditor,
   waitForSerialized,
   waitForStorageEntries,
@@ -82,6 +85,8 @@ const copyImage = async (page, imagePath, number) => {
   await waitForImage(page, getEditorSelector(number));
 };
 
+const switchToStamp = switchToEditor.bind(null, "Stamp");
+
 describe("Stamp Editor", () => {
   describe("Basic operations", () => {
     let pages;
@@ -102,7 +107,7 @@ describe("Stamp Editor", () => {
             return;
           }
 
-          await page.click("#editorStamp");
+          await switchToStamp(page);
           await page.click("#editorStampAddImage");
 
           const input = await page.$("#stampEditorFileInput");
@@ -179,7 +184,7 @@ describe("Stamp Editor", () => {
             return;
           }
 
-          await page.click("#editorStamp");
+          await switchToStamp(page);
           const names = ["bottomLeft", "bottomRight", "topRight", "topLeft"];
 
           for (let i = 0; i < 4; i++) {
@@ -214,16 +219,14 @@ describe("Stamp Editor", () => {
                 `${getEditorSelector(i)} .resizers:not(.hidden)`
               );
 
-              const [name, cursor] = await page.evaluate(() => {
-                const { x, y } = document
-                  .querySelector(".stampEditor")
-                  .getBoundingClientRect();
-                const el = document.elementFromPoint(x, y);
+              const stampRect = await getRect(page, ".stampEditor");
+              const [name, cursor] = await page.evaluate(rect => {
+                const el = document.elementFromPoint(rect.x, rect.y);
                 const cornerName = Array.from(el.classList).find(
                   c => c !== "resizer"
                 );
                 return [cornerName, window.getComputedStyle(el).cursor];
-              });
+              }, stampRect);
 
               expect(name).withContext(`In ${browserName}`).toEqual(names[j]);
               expect(cursor)
@@ -256,7 +259,7 @@ describe("Stamp Editor", () => {
     it("must check that the alt-text flow is correctly implemented", async () => {
       await Promise.all(
         pages.map(async ([browserName, page]) => {
-          await page.click("#editorStamp");
+          await switchToStamp(page);
 
           await copyImage(page, "../images/firefox_logo.png", 0);
 
@@ -425,7 +428,7 @@ describe("Stamp Editor", () => {
     it("must check that the dimensions change", async () => {
       await Promise.all(
         pages.map(async ([browserName, page]) => {
-          await page.click("#editorStamp");
+          await switchToStamp(page);
 
           await copyImage(page, "../images/firefox_logo.png", 0);
 
@@ -593,8 +596,7 @@ describe("Stamp Editor", () => {
     it("must check that a stamp can be undone", async () => {
       await Promise.all(
         pages.map(async ([browserName, page]) => {
-          await page.click("#editorStamp");
-          await page.waitForSelector(".annotationEditorLayer.stampEditing");
+          await switchToStamp(page);
 
           await copyImage(page, "../images/firefox_logo.png", 0);
           await page.waitForSelector(getEditorSelector(0));
@@ -626,8 +628,7 @@ describe("Stamp Editor", () => {
     it("must check that a stamp can be undone", async () => {
       await Promise.all(
         pages.map(async ([browserName, page]) => {
-          await page.click("#editorStamp");
-          await page.waitForSelector(".annotationEditorLayer.stampEditing");
+          await switchToStamp(page);
 
           await copyImage(page, "../images/firefox_logo.png", 0);
           await page.waitForSelector(getEditorSelector(0));
@@ -672,8 +673,7 @@ describe("Stamp Editor", () => {
     it("must check that a stamp can be undone", async () => {
       await Promise.all(
         pages.map(async ([browserName, page]) => {
-          await page.click("#editorStamp");
-          await page.waitForSelector(".annotationEditorLayer.stampEditing");
+          await switchToStamp(page);
 
           await copyImage(page, "../images/firefox_logo.png", 0);
           await page.waitForSelector(getEditorSelector(0));
@@ -694,6 +694,59 @@ describe("Stamp Editor", () => {
           await kbUndo(page);
           await waitForSerialized(page, 1);
           await page.waitForSelector(getEditorSelector(0));
+        })
+      );
+    });
+  });
+
+  describe("Resize a stamp", () => {
+    let pages;
+
+    beforeAll(async () => {
+      pages = await loadAndWait("empty.pdf", ".annotationEditorLayer");
+    });
+
+    afterAll(async () => {
+      await closePages(pages);
+    });
+
+    it("must check that a resized stamp has its canvas at the right position", async () => {
+      await Promise.all(
+        pages.map(async ([browserName, page]) => {
+          await switchToStamp(page);
+
+          await copyImage(page, "../images/firefox_logo.png", 0);
+          await page.waitForSelector(getEditorSelector(0));
+          await waitForSerialized(page, 1);
+
+          const serializedRect = await getFirstSerialized(page, x => x.rect);
+          const rect = await getRect(page, ".resizer.bottomRight");
+          const centerX = rect.x + rect.width / 2;
+          const centerY = rect.y + rect.height / 2;
+
+          await page.mouse.move(centerX, centerY);
+          await page.mouse.down();
+          await page.mouse.move(centerX - 500, centerY - 500);
+          await page.mouse.up();
+
+          await waitForEntryInStorage(
+            page,
+            "rect",
+            serializedRect,
+            (x, y) => x !== y
+          );
+
+          const canvasRect = await getRect(
+            page,
+            `${getEditorSelector(0)} canvas`
+          );
+          const stampRect = await getRect(page, getEditorSelector(0));
+
+          expect(
+            ["x", "y", "width", "height"].every(
+              key => Math.abs(canvasRect[key] - stampRect[key]) <= 10
+            )
+          ).toBeTrue();
         })
       );
     });

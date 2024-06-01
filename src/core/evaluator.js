@@ -53,6 +53,7 @@ import {
 import { getTilingPatternIR, Pattern } from "./pattern.js";
 import { getXfaFontDict, getXfaFontName } from "./xfa_fonts.js";
 import { IdentityToUnicodeMap, ToUnicodeMap } from "./to_unicode_map.js";
+import { isNumberArray, lookupMatrix, lookupNormalRect } from "./core_utils.js";
 import { isPDFFunction, PDFFunctionFactory } from "./function.js";
 import { Lexer, Parser } from "./parser.js";
 import {
@@ -73,7 +74,6 @@ import { getGlyphsUnicode } from "./glyphlist.js";
 import { getMetrics } from "./metrics.js";
 import { getUnicodeForGlyph } from "./unicode.js";
 import { ImageResizer } from "./image_resizer.js";
-import { isNumberArray } from "./core_utils.js";
 import { MurmurHash3_64 } from "../shared/murmurhash3.js";
 import { OperatorList } from "./operator_list.js";
 import { PDFImage } from "./image.js";
@@ -224,7 +224,7 @@ class PartialEvaluator {
     this.globalImageCache = globalImageCache;
     this.systemFontCache = systemFontCache;
     this.options = options || DefaultPartialEvaluatorOptions;
-    this.parsingType3Font = false;
+    this.type3FontRefs = null;
 
     this._regionalImageCache = new RegionalImageCache();
     this._fetchBuiltInCMapBound = this.fetchBuiltInCMap.bind(this);
@@ -241,6 +241,10 @@ class PartialEvaluator {
       isEvalSupported: this.options.isEvalSupported,
     });
     return shadow(this, "_pdfFunctionFactory", pdfFunctionFactory);
+  }
+
+  get parsingType3Font() {
+    return !!this.type3FontRefs;
   }
 
   clone(newOptions = null) {
@@ -460,12 +464,8 @@ class PartialEvaluator {
     localColorSpaceCache
   ) {
     const dict = xobj.dict;
-    const matrix = dict.getArray("Matrix");
-    let bbox = dict.getArray("BBox");
-    bbox =
-      Array.isArray(bbox) && bbox.length === 4
-        ? Util.normalizeRect(bbox)
-        : null;
+    const matrix = lookupMatrix(dict.getArray("Matrix"), null);
+    const bbox = lookupNormalRect(dict.getArray("BBox"), null);
 
     let optionalContent, groupOptions;
     if (dict.has("OC")) {
@@ -797,29 +797,41 @@ class PartialEvaluator {
     args = [objId, w, h];
     operatorList.addImageOps(OPS.paintImageXObject, args, optionalContent);
 
-    // For large (at least 500x500) or more complex images that we'll cache
-    // globally, check if the image is still cached locally on the main-thread
-    // to avoid having to re-parse the image (since that can be slow).
-    if (
-      cacheGlobally &&
-      (w * h > 250000 || dict.has("SMask") || dict.has("Mask"))
-    ) {
-      const localLength = await this.handler.sendWithPromise("commonobj", [
-        objId,
-        "CopyLocalImage",
-        { imageRef },
-      ]);
-
-      if (localLength) {
+    if (cacheGlobally) {
+      if (this.globalImageCache.hasDecodeFailed(imageRef)) {
         this.globalImageCache.setData(imageRef, {
           objId,
           fn: OPS.paintImageXObject,
           args,
           optionalContent,
-          byteSize: 0, // Temporary entry, to avoid `setData` returning early.
+          byteSize: 0, // Data is `null`, since decoding failed previously.
         });
-        this.globalImageCache.addByteSize(imageRef, localLength);
+
+        this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
         return;
+      }
+
+      // For large (at least 500x500) or more complex images that we'll cache
+      // globally, check if the image is still cached locally on the main-thread
+      // to avoid having to re-parse the image (since that can be slow).
+      if (w * h > 250000 || dict.has("SMask") || dict.has("Mask")) {
+        const localLength = await this.handler.sendWithPromise("commonobj", [
+          objId,
+          "CopyLocalImage",
+          { imageRef },
+        ]);
+
+        if (localLength) {
+          this.globalImageCache.setData(imageRef, {
+            objId,
+            fn: OPS.paintImageXObject,
+            args,
+            optionalContent,
+            byteSize: 0, // Temporary entry, to avoid `setData` returning early.
+          });
+          this.globalImageCache.addByteSize(imageRef, localLength);
+          return;
+        }
       }
     }
 
@@ -850,6 +862,9 @@ class PartialEvaluator {
       .catch(reason => {
         warn(`Unable to decode image "${objId}": "${reason}".`);
 
+        if (imageRef) {
+          this.globalImageCache.addDecodeFailed(imageRef);
+        }
         return this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
       });
 
@@ -1242,7 +1257,7 @@ class PartialEvaluator {
       }
     }
     if (fontRef) {
-      if (this.parsingType3Font && this.type3FontRefs.has(fontRef)) {
+      if (this.type3FontRefs?.has(fontRef)) {
         return errorFont();
       }
 
@@ -1250,7 +1265,11 @@ class PartialEvaluator {
         return this.fontCache.get(fontRef);
       }
 
-      font = this.xref.fetchIfRef(fontRef);
+      try {
+        font = this.xref.fetchIfRef(fontRef);
+      } catch (ex) {
+        warn(`loadFont - lookup failed: "${ex}".`);
+      }
     }
 
     if (!(font instanceof Dict)) {
@@ -1578,7 +1597,7 @@ class PartialEvaluator {
             localShadingPatternCache,
           });
           if (objId) {
-            const matrix = dict.getArray("Matrix");
+            const matrix = lookupMatrix(dict.getArray("Matrix"), null);
             operatorList.addOp(fn, ["Shading", objId, matrix]);
           }
           return undefined;
@@ -2311,6 +2330,7 @@ class PartialEvaluator {
     sink,
     seenStyles = new Set(),
     viewBox,
+    lang = null,
     markedContentData = null,
     disableNormalization = false,
     keepWhiteSpace = false,
@@ -2327,6 +2347,7 @@ class PartialEvaluator {
     const textContent = {
       items: [],
       styles: Object.create(null),
+      lang,
     };
     const textContentItem = {
       initialized: false,
@@ -3265,8 +3286,8 @@ class PartialEvaluator {
                 const currentState = stateManager.state.clone();
                 const xObjStateManager = new StateManager(currentState);
 
-                const matrix = xobj.dict.getArray("Matrix");
-                if (Array.isArray(matrix) && matrix.length === 6) {
+                const matrix = lookupMatrix(xobj.dict.getArray("Matrix"), null);
+                if (matrix) {
                   xObjStateManager.transform(matrix);
                 }
 
@@ -3300,6 +3321,7 @@ class PartialEvaluator {
                     sink: sinkWrapper,
                     seenStyles,
                     viewBox,
+                    lang,
                     markedContentData,
                     disableNormalization,
                     keepWhiteSpace,
@@ -4244,10 +4266,7 @@ class PartialEvaluator {
 
     if (!descriptor) {
       if (isType3Font) {
-        let bbox = dict.getArray("FontBBox");
-        if (!isNumberArray(bbox, 4)) {
-          bbox = [0, 0, 0, 0];
-        }
+        const bbox = lookupNormalRect(dict.getArray("FontBBox"), [0, 0, 0, 0]);
         // FontDescriptor is only required for Type3 fonts when the document
         // is a tagged pdf. Create a barbebones one to get by.
         descriptor = new Dict(null);
@@ -4315,11 +4334,15 @@ class PartialEvaluator {
           dict,
           properties
         );
-        if (widths) {
+        if (Array.isArray(widths)) {
           const glyphWidths = [];
           let j = firstChar;
-          for (const width of widths) {
-            glyphWidths[j++] = this.xref.fetchIfRef(width);
+          for (const w of widths) {
+            const width = this.xref.fetchIfRef(w);
+            if (typeof width === "number") {
+              glyphWidths[j] = width;
+            }
+            j++;
           }
           newProperties.widths = glyphWidths;
         } else {
@@ -4433,14 +4456,14 @@ class PartialEvaluator {
       }
     }
 
-    let fontMatrix = dict.getArray("FontMatrix");
-    if (!isNumberArray(fontMatrix, 6)) {
-      fontMatrix = FONT_IDENTITY_MATRIX;
-    }
-    let bbox = descriptor.getArray("FontBBox") || dict.getArray("FontBBox");
-    if (!isNumberArray(bbox, 4)) {
-      bbox = undefined;
-    }
+    const fontMatrix = lookupMatrix(
+      dict.getArray("FontMatrix"),
+      FONT_IDENTITY_MATRIX
+    );
+    const bbox = lookupNormalRect(
+      descriptor.getArray("FontBBox") || dict.getArray("FontBBox"),
+      undefined
+    );
     let ascent = descriptor.get("Ascent");
     if (typeof ascent !== "number") {
       ascent = undefined;
@@ -4614,7 +4637,6 @@ class TranslatedFont {
     // Compared to the parsing of e.g. an entire page, it doesn't really
     // make sense to only be able to render a Type3 glyph partially.
     const type3Evaluator = evaluator.clone({ ignoreErrors: false });
-    type3Evaluator.parsingType3Font = true;
     // Prevent circular references in Type3 fonts.
     const type3FontRefs = new RefSet(evaluator.type3FontRefs);
     if (this.dict.objId && !type3FontRefs.has(this.dict.objId)) {

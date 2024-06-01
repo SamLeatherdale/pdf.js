@@ -40,6 +40,7 @@ import {
   getInheritableProperty,
   getNewAnnotationsMap,
   isWhiteSpace,
+  lookupNormalRect,
   MissingDataException,
   PDF_VERSION_REGEXP,
   validateCSSFont,
@@ -160,10 +161,12 @@ class Page {
     if (this.xfaData) {
       return this.xfaData.bbox;
     }
-    let box = this._getInheritableProperty(name, /* getArray = */ true);
+    const box = lookupNormalRect(
+      this._getInheritableProperty(name, /* getArray = */ true),
+      null
+    );
 
-    if (Array.isArray(box) && box.length === 4) {
-      box = Util.normalizeRect(box);
+    if (box) {
       if (box[2] - box[0] > 0 && box[3] - box[1] > 0) {
         return box;
       }
@@ -392,10 +395,9 @@ class Page {
   }
 
   loadResources(keys) {
-    if (!this.resourcesPromise) {
-      // TODO: add async `_getInheritableProperty` and remove this.
-      this.resourcesPromise = this.pdfManager.ensure(this, "resources");
-    }
+    // TODO: add async `_getInheritableProperty` and remove this.
+    this.resourcesPromise ||= this.pdfManager.ensure(this, "resources");
+
     return this.resourcesPromise.then(() => {
       const objectLoader = new ObjectLoader(this.resources, keys, this.xref);
       return objectLoader.load();
@@ -434,77 +436,78 @@ class Page {
       options: this.evaluatorOptions,
     });
 
-    const newAnnotationsByPage = !this.xfaFactory
+    const newAnnotsByPage = !this.xfaFactory
       ? getNewAnnotationsMap(annotationStorage)
       : null;
+    const newAnnots = newAnnotsByPage?.get(this.pageIndex);
+    let newAnnotationsPromise = Promise.resolve(null);
     let deletedAnnotations = null;
 
-    let newAnnotationsPromise = Promise.resolve(null);
-    if (newAnnotationsByPage) {
-      const newAnnotations = newAnnotationsByPage.get(this.pageIndex);
-      if (newAnnotations) {
-        const annotationGlobalsPromise =
-          this.pdfManager.ensureDoc("annotationGlobals");
-        let imagePromises;
+    if (newAnnots) {
+      const annotationGlobalsPromise =
+        this.pdfManager.ensureDoc("annotationGlobals");
+      let imagePromises;
 
-        // An annotation can contain a reference to a bitmap, but this bitmap
-        // is defined in another annotation. So we need to find this annotation
-        // and generate the bitmap.
-        const missingBitmaps = new Set();
-        for (const { bitmapId, bitmap } of newAnnotations) {
-          if (bitmapId && !bitmap && !missingBitmaps.has(bitmapId)) {
-            missingBitmaps.add(bitmapId);
+      // An annotation can contain a reference to a bitmap, but this bitmap
+      // is defined in another annotation. So we need to find this annotation
+      // and generate the bitmap.
+      const missingBitmaps = new Set();
+      for (const { bitmapId, bitmap } of newAnnots) {
+        if (bitmapId && !bitmap && !missingBitmaps.has(bitmapId)) {
+          missingBitmaps.add(bitmapId);
+        }
+      }
+
+      const { isOffscreenCanvasSupported } = this.evaluatorOptions;
+      if (missingBitmaps.size > 0) {
+        const annotationWithBitmaps = newAnnots.slice();
+        for (const [key, annotation] of annotationStorage) {
+          if (!key.startsWith(AnnotationEditorPrefix)) {
+            continue;
+          }
+          if (annotation.bitmap && missingBitmaps.has(annotation.bitmapId)) {
+            annotationWithBitmaps.push(annotation);
           }
         }
-
-        const { isOffscreenCanvasSupported } = this.evaluatorOptions;
-        if (missingBitmaps.size > 0) {
-          const annotationWithBitmaps = newAnnotations.slice();
-          for (const [key, annotation] of annotationStorage) {
-            if (!key.startsWith(AnnotationEditorPrefix)) {
-              continue;
-            }
-            if (annotation.bitmap && missingBitmaps.has(annotation.bitmapId)) {
-              annotationWithBitmaps.push(annotation);
-            }
-          }
-          // The array annotationWithBitmaps cannot be empty: the check above
-          // makes sure to have at least one annotation containing the bitmap.
-          imagePromises = AnnotationFactory.generateImages(
-            annotationWithBitmaps,
-            this.xref,
-            isOffscreenCanvasSupported
-          );
-        } else {
-          imagePromises = AnnotationFactory.generateImages(
-            newAnnotations,
-            this.xref,
-            isOffscreenCanvasSupported
-          );
-        }
-
-        deletedAnnotations = new RefSet();
-        this.#replaceIdByRef(newAnnotations, deletedAnnotations, null);
-
-        newAnnotationsPromise = annotationGlobalsPromise.then(
-          annotationGlobals => {
-            if (!annotationGlobals) {
-              return null;
-            }
-
-            return AnnotationFactory.printNewAnnotations(
-              annotationGlobals,
-              partialEvaluator,
-              task,
-              newAnnotations,
-              imagePromises
-            );
-          }
+        // The array annotationWithBitmaps cannot be empty: the check above
+        // makes sure to have at least one annotation containing the bitmap.
+        imagePromises = AnnotationFactory.generateImages(
+          annotationWithBitmaps,
+          this.xref,
+          isOffscreenCanvasSupported
+        );
+      } else {
+        imagePromises = AnnotationFactory.generateImages(
+          newAnnots,
+          this.xref,
+          isOffscreenCanvasSupported
         );
       }
+
+      deletedAnnotations = new RefSet();
+      this.#replaceIdByRef(newAnnots, deletedAnnotations, null);
+
+      newAnnotationsPromise = annotationGlobalsPromise.then(
+        annotationGlobals => {
+          if (!annotationGlobals) {
+            return null;
+          }
+
+          return AnnotationFactory.printNewAnnotations(
+            annotationGlobals,
+            partialEvaluator,
+            task,
+            newAnnots,
+            imagePromises
+          );
+        }
+      );
     }
-    const dataPromises = Promise.all([contentStreamPromise, resourcesPromise]);
-    const pageListPromise = dataPromises.then(([contentStream]) => {
+
+    const pageListPromise = Promise.all([
+      contentStreamPromise,
+      resourcesPromise,
+    ]).then(([contentStream]) => {
       const opList = new OperatorList(intent, sink);
 
       handler.send("StartRenderPage", {
@@ -622,7 +625,7 @@ class Page {
     });
   }
 
-  extractTextContent({
+  async extractTextContent({
     handler,
     task,
     includeMarkedContent,
@@ -636,31 +639,35 @@ class Page {
       "Properties",
       "XObject",
     ]);
+    const langPromise = this.pdfManager.ensureCatalog("lang");
 
-    const dataPromises = Promise.all([contentStreamPromise, resourcesPromise]);
-    return dataPromises.then(([contentStream]) => {
-      const partialEvaluator = new PartialEvaluator({
-        xref: this.xref,
-        handler,
-        pageIndex: this.pageIndex,
-        idFactory: this._localIdFactory,
-        fontCache: this.fontCache,
-        builtInCMapCache: this.builtInCMapCache,
-        standardFontDataCache: this.standardFontDataCache,
-        globalImageCache: this.globalImageCache,
-        systemFontCache: this.systemFontCache,
-        options: this.evaluatorOptions,
-      });
+    const [contentStream, , lang] = await Promise.all([
+      contentStreamPromise,
+      resourcesPromise,
+      langPromise,
+    ]);
+    const partialEvaluator = new PartialEvaluator({
+      xref: this.xref,
+      handler,
+      pageIndex: this.pageIndex,
+      idFactory: this._localIdFactory,
+      fontCache: this.fontCache,
+      builtInCMapCache: this.builtInCMapCache,
+      standardFontDataCache: this.standardFontDataCache,
+      globalImageCache: this.globalImageCache,
+      systemFontCache: this.systemFontCache,
+      options: this.evaluatorOptions,
+    });
 
-      return partialEvaluator.getTextContent({
-        stream: contentStream,
-        task,
-        resources: this.resources,
-        includeMarkedContent,
-        disableNormalization,
-        sink,
-        viewBox: this.view,
-      });
+    return partialEvaluator.getTextContent({
+      stream: contentStream,
+      task,
+      resources: this.resources,
+      includeMarkedContent,
+      disableNormalization,
+      sink,
+      viewBox: this.view,
+      lang,
     });
   }
 
@@ -1570,7 +1577,10 @@ class PDFDocument {
         if (type instanceof Ref) {
           type = await xref.fetchAsync(type);
         }
-        if (isName(type, "Page") || (!obj.has("Type") && !obj.has("Kids"))) {
+        if (
+          isName(type, "Page") ||
+          (!obj.has("Type") && !obj.has("Kids") && obj.has("Contents"))
+        ) {
           if (!catalog.pageKidsCountCache.has(ref)) {
             catalog.pageKidsCountCache.put(ref, 1); // Cache the Page reference.
           }

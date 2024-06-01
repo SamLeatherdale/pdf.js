@@ -58,10 +58,10 @@ import {
   NodeCanvasFactory,
   NodeCMapReaderFactory,
   NodeFilterFactory,
+  NodePackages,
   NodeStandardFontDataFactory,
 } from "display-node_utils";
 import { CanvasGraphics } from "./canvas.js";
-import { cleanupTextLayer } from "./text_layer.js";
 import { GlobalWorkerOptions } from "./worker_options.js";
 import { MessageHandler } from "../shared/message_handler.js";
 import { Metadata } from "./metadata.js";
@@ -70,6 +70,7 @@ import { PDFDataTransportStream } from "./transport_stream.js";
 import { PDFFetchStream } from "display-fetch_stream";
 import { PDFNetworkStream } from "display-network";
 import { PDFNodeStream } from "display-node_stream";
+import { TextLayer } from "./text_layer.js";
 import { XfaText } from "./xfa_text.js";
 
 const DEFAULT_RANGE_CHUNK_SIZE = 65536; // 2^16 = 65536
@@ -356,7 +357,7 @@ function getDocument(src) {
     task._worker = worker;
   }
 
-  const fetchDocParams = {
+  const docParams = {
     docId,
     apiVersion:
       typeof PDFJSDev !== "undefined" && !PDFJSDev.test("TESTING")
@@ -383,14 +384,15 @@ function getDocument(src) {
     },
   };
   const transportParams = {
-    ignoreErrors,
     disableFontFace,
     fontExtraProperties,
-    enableXfa,
     ownerDocument,
-    disableAutoFetch,
     pdfBug,
     styleElement,
+    loadingParams: {
+      disableAutoFetch,
+      enableXfa,
+    },
   };
 
   worker.promise
@@ -398,105 +400,82 @@ function getDocument(src) {
       if (task.destroyed) {
         throw new Error("Loading aborted");
       }
+      if (worker.destroyed) {
+        throw new Error("Worker was destroyed");
+      }
 
-      const workerIdPromise = _fetchDocument(worker, fetchDocParams);
-      const networkStreamPromise = new Promise(function (resolve) {
-        let networkStream;
-        if (rangeTransport) {
-          networkStream = new PDFDataTransportStream(rangeTransport, {
-            disableRange,
-            disableStream,
-          });
-        } else if (!data) {
-          if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
-            throw new Error("Not implemented: createPDFNetworkStream");
-          }
-          const createPDFNetworkStream = params => {
-            if (
-              typeof PDFJSDev !== "undefined" &&
-              PDFJSDev.test("GENERIC") &&
-              isNodeJS
-            ) {
-              const isFetchSupported = function () {
-                return (
-                  typeof fetch !== "undefined" &&
-                  typeof Response !== "undefined" &&
-                  "body" in Response.prototype
-                );
-              };
-              return isFetchSupported() && isValidFetchUrl(params.url)
-                ? new PDFFetchStream(params)
-                : new PDFNodeStream(params);
-            }
-            return isValidFetchUrl(params.url)
-              ? new PDFFetchStream(params)
-              : new PDFNetworkStream(params);
-          };
-
-          networkStream = createPDFNetworkStream({
-            url,
-            length,
-            httpHeaders,
-            withCredentials,
-            rangeChunkSize,
-            disableRange,
-            disableStream,
-          });
-        }
-        resolve(networkStream);
-      });
-
-      return Promise.all([workerIdPromise, networkStreamPromise]).then(
-        function ([workerId, networkStream]) {
-          if (task.destroyed) {
-            throw new Error("Loading aborted");
-          }
-
-          const messageHandler = new MessageHandler(
-            docId,
-            workerId,
-            worker.port
-          );
-          const transport = new WorkerTransport(
-            messageHandler,
-            task,
-            networkStream,
-            transportParams,
-            transportFactory
-          );
-          task._transport = transport;
-          messageHandler.send("Ready", null);
-        }
+      const workerIdPromise = worker.messageHandler.sendWithPromise(
+        "GetDocRequest",
+        docParams,
+        data ? [data.buffer] : null
       );
+
+      let networkStream;
+      if (rangeTransport) {
+        networkStream = new PDFDataTransportStream(rangeTransport, {
+          disableRange,
+          disableStream,
+        });
+      } else if (!data) {
+        if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
+          throw new Error("Not implemented: createPDFNetworkStream");
+        }
+        const createPDFNetworkStream = params => {
+          if (
+            typeof PDFJSDev !== "undefined" &&
+            PDFJSDev.test("GENERIC") &&
+            isNodeJS
+          ) {
+            const isFetchSupported = function () {
+              return (
+                typeof fetch !== "undefined" &&
+                typeof Response !== "undefined" &&
+                "body" in Response.prototype
+              );
+            };
+            return isFetchSupported() && isValidFetchUrl(params.url)
+              ? new PDFFetchStream(params)
+              : new PDFNodeStream(params);
+          }
+          return isValidFetchUrl(params.url)
+            ? new PDFFetchStream(params)
+            : new PDFNetworkStream(params);
+        };
+
+        networkStream = createPDFNetworkStream({
+          url,
+          length,
+          httpHeaders,
+          withCredentials,
+          rangeChunkSize,
+          disableRange,
+          disableStream,
+        });
+      }
+
+      return workerIdPromise.then(workerId => {
+        if (task.destroyed) {
+          throw new Error("Loading aborted");
+        }
+        if (worker.destroyed) {
+          throw new Error("Worker was destroyed");
+        }
+
+        const messageHandler = new MessageHandler(docId, workerId, worker.port);
+        const transport = new WorkerTransport(
+          messageHandler,
+          task,
+          networkStream,
+          transportParams,
+          transportFactory
+        );
+        task._transport = transport;
+        messageHandler.send("Ready", null);
+      });
     })
     .catch(task._capability.reject);
 
   return task;
-}
-
-/**
- * Starts fetching of specified PDF document/data.
- *
- * @param {PDFWorker} worker
- * @param {Object} source
- * @returns {Promise<string>} A promise that is resolved when the worker ID of
- *   the `MessageHandler` is known.
- * @private
- */
-async function _fetchDocument(worker, source) {
-  if (worker.destroyed) {
-    throw new Error("Worker was destroyed");
-  }
-  const workerId = await worker.messageHandler.sendWithPromise(
-    "GetDocRequest",
-    source,
-    source.data ? [source.data.buffer] : null
-  );
-
-  if (worker.destroyed) {
-    throw new Error("Worker was destroyed");
-  }
-  return workerId;
 }
 
 function getUrlProp(val) {
@@ -1160,6 +1139,7 @@ class PDFDocumentProxy {
  *   items are included when includeMarkedContent is true.
  * @property {Object<string, TextStyle>} styles - {@link TextStyle} objects,
  *   indexed by font name.
+ * @property {string | null} lang - The document /Lang attribute.
  */
 
 /**
@@ -1510,8 +1490,14 @@ class PDFPageProxy {
         internalRenderTask.capability.resolve();
       }
 
-      this._stats?.timeEnd("Rendering");
-      this._stats?.timeEnd("Overall");
+      if (this._stats) {
+        this._stats.timeEnd("Rendering");
+        this._stats.timeEnd("Overall");
+
+        if (globalThis.Stats?.enabled) {
+          globalThis.Stats.add(this.pageNumber, this._stats);
+        }
+      }
     };
 
     const internalRenderTask = new InternalRenderTask({
@@ -1671,6 +1657,7 @@ class PDFPageProxy {
             resolve(textContent);
             return;
           }
+          textContent.lang ??= value.lang;
           Object.assign(textContent.styles, value.styles);
           textContent.items.push(...value.items);
           pump();
@@ -1681,6 +1668,7 @@ class PDFPageProxy {
       const textContent = {
         items: [],
         styles: Object.create(null),
+        lang: null,
       };
       pump();
     });
@@ -2089,6 +2077,14 @@ class PDFWorker {
    * @type {Promise<void>}
    */
   get promise() {
+    if (
+      typeof PDFJSDev !== "undefined" &&
+      PDFJSDev.test("GENERIC") &&
+      isNodeJS
+    ) {
+      // Ensure that all Node.js packages/polyfills have loaded.
+      return Promise.all([NodePackages.promise, this._readyCapability.promise]);
+    }
     return this._readyCapability.promise;
   }
 
@@ -2370,6 +2366,7 @@ class WorkerTransport {
       ownerDocument: params.ownerDocument,
       styleElement: params.styleElement,
     });
+    this.loadingParams = params.loadingParams;
     this._params = params;
 
     this.canvasFactory = factory.canvasFactory;
@@ -2517,7 +2514,7 @@ class WorkerTransport {
       this.fontLoader.clear();
       this.#methodPromises.clear();
       this.filterFactory.destroy();
-      cleanupTextLayer();
+      TextLayer.cleanup();
 
       this._networkStream?.cancelAllRequests(
         new AbortException("Worker was terminated.")
@@ -2750,7 +2747,7 @@ class WorkerTransport {
 
       switch (type) {
         case "Font":
-          const params = this._params;
+          const { disableFontFace, fontExtraProperties, pdfBug } = this._params;
 
           if ("error" in exportedData) {
             const exportedError = exportedData.error;
@@ -2760,12 +2757,11 @@ class WorkerTransport {
           }
 
           const inspectFont =
-            params.pdfBug && globalThis.FontInspector?.enabled
+            pdfBug && globalThis.FontInspector?.enabled
               ? (font, url) => globalThis.FontInspector.fontAdded(font, url)
               : null;
           const font = new FontFaceObject(exportedData, {
-            disableFontFace: params.disableFontFace,
-            ignoreErrors: params.ignoreErrors,
+            disableFontFace,
             inspectFont,
           });
 
@@ -2773,7 +2769,7 @@ class WorkerTransport {
             .bind(font)
             .catch(() => messageHandler.sendWithPromise("FontFallback", { id }))
             .finally(() => {
-              if (!params.fontExtraProperties && font.data) {
+              if (!fontExtraProperties && font.data) {
                 // Immediately release the `font.data` property once the font
                 // has been attached to the DOM, since it's no longer needed,
                 // rather than waiting for a `PDFDocumentProxy.cleanup` call.
@@ -2790,7 +2786,7 @@ class WorkerTransport {
 
           for (const pageProxy of this.#pageCache.values()) {
             for (const [, data] of pageProxy.objs) {
-              if (data.ref !== imageRef) {
+              if (data?.ref !== imageRef) {
                 continue;
               }
               if (!data.dataLen) {
@@ -3092,7 +3088,7 @@ class WorkerTransport {
     }
     this.#methodPromises.clear();
     this.filterFactory.destroy(/* keepHCM = */ true);
-    cleanupTextLayer();
+    TextLayer.cleanup();
   }
 
   cachedPageNumber(ref) {
@@ -3101,14 +3097,6 @@ class WorkerTransport {
     }
     const refStr = ref.gen === 0 ? `${ref.num}R` : `${ref.num}R${ref.gen}`;
     return this.#pageRefCache.get(refStr) ?? null;
-  }
-
-  get loadingParams() {
-    const { disableAutoFetch, enableXfa } = this._params;
-    return shadow(this, "loadingParams", {
-      disableAutoFetch,
-      enableXfa,
-    });
   }
 }
 

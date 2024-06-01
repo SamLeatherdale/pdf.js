@@ -265,9 +265,27 @@ const PDFViewerApplication = {
     const { mainContainer, viewerContainer } = this.appConfig,
       params = parseQueryString(hash);
 
+    const loadPDFBug = async () => {
+      if (this._PDFBug) {
+        return;
+      }
+      const { PDFBug } =
+        typeof PDFJSDev === "undefined"
+          ? await import(AppOptions.get("debuggerSrc")) // eslint-disable-line no-unsanitized/method
+          : await __non_webpack_import__(AppOptions.get("debuggerSrc"));
+
+      this._PDFBug = PDFBug;
+    };
+
     if (params.get("disableworker") === "true") {
       try {
-        await loadFakeWorker();
+        GlobalWorkerOptions.workerSrc ||= AppOptions.get("workerSrc");
+
+        if (typeof PDFJSDev === "undefined") {
+          globalThis.pdfjsWorker = await import("pdfjs/pdf.worker.js");
+        } else {
+          await __non_webpack_import__(PDFWorker.workerSrc);
+        }
       } catch (ex) {
         console.error(`_parseHashParams: "${ex.message}".`);
       }
@@ -306,7 +324,7 @@ const PDFViewerApplication = {
         case "hover":
           viewerContainer.classList.add(`textLayer-${params.get("textlayer")}`);
           try {
-            await loadPDFBug(this);
+            await loadPDFBug();
             this._PDFBug.loadCSS();
           } catch (ex) {
             console.error(`_parseHashParams: "${ex.message}".`);
@@ -315,12 +333,11 @@ const PDFViewerApplication = {
       }
     }
     if (params.has("pdfbug")) {
-      AppOptions.set("pdfBug", true);
-      AppOptions.set("fontExtraProperties", true);
+      AppOptions.setAll({ pdfBug: true, fontExtraProperties: true });
 
       const enabled = params.get("pdfbug").split(",");
       try {
-        await loadPDFBug(this);
+        await loadPDFBug();
         this._PDFBug.init(mainContainer, enabled);
       } catch (ex) {
         console.error(`_parseHashParams: "${ex.message}".`);
@@ -340,6 +357,12 @@ const PDFViewerApplication = {
         AppOptions.set(
           "highlightEditorColors",
           params.get("highlighteditorcolors")
+        );
+      }
+      if (params.has("maxcanvaspixels")) {
+        AppOptions.set(
+          "maxCanvasPixels",
+          Number(params.get("maxcanvaspixels"))
         );
       }
       if (params.has("supportscaretbrowsingmode")) {
@@ -720,26 +743,24 @@ const PDFViewerApplication = {
     return this._initializedCapability.promise;
   },
 
-  zoomIn(steps, scaleFactor) {
+  updateZoom(steps, scaleFactor, origin) {
     if (this.pdfViewer.isInPresentationMode) {
       return;
     }
-    this.pdfViewer.increaseScale({
+    this.pdfViewer.updateScale({
       drawingDelay: AppOptions.get("defaultZoomDelay"),
       steps,
       scaleFactor,
+      origin,
     });
   },
 
-  zoomOut(steps, scaleFactor) {
-    if (this.pdfViewer.isInPresentationMode) {
-      return;
-    }
-    this.pdfViewer.decreaseScale({
-      drawingDelay: AppOptions.get("defaultZoomDelay"),
-      steps,
-      scaleFactor,
-    });
+  zoomIn() {
+    this.updateZoom(1);
+  },
+
+  zoomOut() {
+    this.updateZoom(-1);
   },
 
   zoomReset() {
@@ -979,6 +1000,16 @@ const PDFViewerApplication = {
       AppOptions.set("docBaseUrl", document.URL.split("#", 1)[0]);
     } else if (PDFJSDev.test("MOZCENTRAL || CHROME")) {
       AppOptions.set("docBaseUrl", this.baseUrl);
+    }
+
+    // On Android, there is almost no chance to have the font we want so we
+    // don't use the system fonts in this case.
+    if (
+      typeof PDFJSDev === "undefined"
+        ? window.isGECKOVIEW
+        : PDFJSDev.test("GECKOVIEW")
+    ) {
+      args.useSystemFonts = false;
     }
 
     // Set the necessary API parameters, using all the available options.
@@ -1898,10 +1929,6 @@ const PDFViewerApplication = {
       signal,
     });
 
-    if (AppOptions.get("pdfBug")) {
-      eventBus._on("pagerendered", reportPageStatsPDFBug, { signal });
-      eventBus._on("pagechanging", reportPageStatsPDFBug, { signal });
-    }
     if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
       eventBus._on("fileinputchange", webViewerFileInputChange, { signal });
       eventBus._on("openfile", webViewerOpenFile, { signal });
@@ -2031,8 +2058,8 @@ const PDFViewerApplication = {
         passive: true,
         signal,
       });
-      mainContainer.removeEventListener("scrollend", scrollend, { signal });
-      mainContainer.removeEventListener("blur", scrollend, { signal });
+      mainContainer.removeEventListener("scrollend", scrollend);
+      mainContainer.removeEventListener("blur", scrollend);
     };
     const scroll = () => {
       if (this._isCtrlKeyDown) {
@@ -2046,10 +2073,7 @@ const PDFViewerApplication = {
         return;
       }
 
-      mainContainer.removeEventListener("scroll", scroll, {
-        passive: true,
-        signal,
-      });
+      mainContainer.removeEventListener("scroll", scroll, { passive: true });
       this._isScrolling = true;
       mainContainer.addEventListener("scrollend", scrollend, { signal });
       mainContainer.addEventListener("blur", scrollend, { signal });
@@ -2096,16 +2120,6 @@ const PDFViewerApplication = {
     this[prop] = factor / newFactor;
 
     return newFactor;
-  },
-
-  _centerAtPos(previousScale, x, y) {
-    const { pdfViewer } = this;
-    const scaleDiff = pdfViewer.currentScale / previousScale - 1;
-    if (scaleDiff !== 0) {
-      const [top, left] = pdfViewer.containerTopLeft;
-      pdfViewer.container.scrollLeft += (x - left) * scaleDiff;
-      pdfViewer.container.scrollTop += (y - top) * scaleDiff;
-    }
   },
 
   /**
@@ -2166,35 +2180,6 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
       throw ex;
     }
   };
-}
-
-async function loadFakeWorker() {
-  GlobalWorkerOptions.workerSrc ||= AppOptions.get("workerSrc");
-
-  if (typeof PDFJSDev === "undefined") {
-    globalThis.pdfjsWorker = await import("pdfjs/pdf.worker.js");
-    return;
-  }
-  await __non_webpack_import__(PDFWorker.workerSrc);
-}
-
-async function loadPDFBug(self) {
-  const { PDFBug } =
-    typeof PDFJSDev === "undefined"
-      ? await import(AppOptions.get("debuggerSrc")) // eslint-disable-line no-unsanitized/method
-      : await __non_webpack_import__(AppOptions.get("debuggerSrc"));
-
-  self._PDFBug = PDFBug;
-}
-
-function reportPageStatsPDFBug({ pageNumber }) {
-  if (!globalThis.Stats?.enabled) {
-    return;
-  }
-  const pageView = PDFViewerApplication.pdfViewer.getPageView(
-    /* index = */ pageNumber - 1
-  );
-  globalThis.Stats.add(pageNumber, pageView?.pdfPage?.stats);
 }
 
 function webViewerPageRender({ pageNumber }) {
@@ -2613,6 +2598,7 @@ function webViewerWheel(evt) {
     evt.deltaX === 0 &&
     (Math.abs(scaleFactor - 1) < 0.05 || isBuiltInMac) &&
     evt.deltaZ === 0;
+  const origin = [evt.clientX, evt.clientY];
 
   if (
     isPinchToZoom ||
@@ -2631,20 +2617,13 @@ function webViewerWheel(evt) {
       return;
     }
 
-    const previousScale = pdfViewer.currentScale;
     if (isPinchToZoom && supportsPinchToZoom) {
       scaleFactor = PDFViewerApplication._accumulateFactor(
-        previousScale,
+        pdfViewer.currentScale,
         scaleFactor,
         "_wheelUnusedFactor"
       );
-      if (scaleFactor < 1) {
-        PDFViewerApplication.zoomOut(null, scaleFactor);
-      } else if (scaleFactor > 1) {
-        PDFViewerApplication.zoomIn(null, scaleFactor);
-      } else {
-        return;
-      }
+      PDFViewerApplication.updateZoom(null, scaleFactor, origin);
     } else {
       const delta = normalizeWheelEventDirection(evt);
 
@@ -2676,19 +2655,8 @@ function webViewerWheel(evt) {
         );
       }
 
-      if (ticks < 0) {
-        PDFViewerApplication.zoomOut(-ticks);
-      } else if (ticks > 0) {
-        PDFViewerApplication.zoomIn(ticks);
-      } else {
-        return;
-      }
+      PDFViewerApplication.updateZoom(ticks, null, origin);
     }
-
-    // After scaling the page via zoomIn/zoomOut, the position of the upper-
-    // left corner is restored. When the mouse wheel is used, the position
-    // under the cursor should be restored instead.
-    PDFViewerApplication._centerAtPos(previousScale, evt.clientX, evt.clientY);
   }
 }
 
@@ -2788,42 +2756,24 @@ function webViewerTouchMove(evt) {
 
   evt.preventDefault();
 
+  const origin = [(page0X + page1X) / 2, (page0Y + page1Y) / 2];
   const distance = Math.hypot(page0X - page1X, page0Y - page1Y) || 1;
   const pDistance = Math.hypot(pTouch0X - pTouch1X, pTouch0Y - pTouch1Y) || 1;
-  const previousScale = pdfViewer.currentScale;
   if (supportsPinchToZoom) {
     const newScaleFactor = PDFViewerApplication._accumulateFactor(
-      previousScale,
+      pdfViewer.currentScale,
       distance / pDistance,
       "_touchUnusedFactor"
     );
-    if (newScaleFactor < 1) {
-      PDFViewerApplication.zoomOut(null, newScaleFactor);
-    } else if (newScaleFactor > 1) {
-      PDFViewerApplication.zoomIn(null, newScaleFactor);
-    } else {
-      return;
-    }
+    PDFViewerApplication.updateZoom(null, newScaleFactor, origin);
   } else {
     const PIXELS_PER_LINE_SCALE = 30;
     const ticks = PDFViewerApplication._accumulateTicks(
       (distance - pDistance) / PIXELS_PER_LINE_SCALE,
       "_touchUnusedTicks"
     );
-    if (ticks < 0) {
-      PDFViewerApplication.zoomOut(-ticks);
-    } else if (ticks > 0) {
-      PDFViewerApplication.zoomIn(ticks);
-    } else {
-      return;
-    }
+    PDFViewerApplication.updateZoom(ticks, null, origin);
   }
-
-  PDFViewerApplication._centerAtPos(
-    previousScale,
-    (page0X + page1X) / 2,
-    (page0Y + page1Y) / 2
-  );
 }
 
 function webViewerTouchEnd(evt) {

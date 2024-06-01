@@ -13,9 +13,94 @@
  * limitations under the License.
  */
 
-import { closePages, loadAndWait } from "./test_utils.mjs";
+import {
+  awaitPromise,
+  closePages,
+  createPromise,
+  getSpanRectFromText,
+  loadAndWait,
+} from "./test_utils.mjs";
 
 describe("PDF viewer", () => {
+  describe("Zoom origin", () => {
+    let pages;
+
+    beforeAll(async () => {
+      pages = await loadAndWait(
+        "tracemonkey.pdf",
+        ".textLayer .endOfContent",
+        "page-width",
+        null,
+        { page: 2 }
+      );
+    });
+
+    afterAll(async () => {
+      await closePages(pages);
+    });
+
+    async function getTextAt(page, pageNumber, coordX, coordY) {
+      await page.waitForFunction(
+        pageNum =>
+          !document.querySelector(
+            `.page[data-page-number="${pageNum}"] > .textLayer`
+          ).hidden,
+        {},
+        pageNumber
+      );
+      return page.evaluate(
+        (x, y) => document.elementFromPoint(x, y)?.textContent,
+        coordX,
+        coordY
+      );
+    }
+
+    it("supports specifiying a custom origin", async () => {
+      await Promise.all(
+        pages.map(async ([browserName, page]) => {
+          // We use this text span of page 2 because:
+          // - it's in the visible area even when zooming at page-width
+          // - it's small, so it easily catches if the page moves too much
+          // - it's in a "random" position: not near the center of the
+          //   viewport, and not near the borders
+          const text = "guards";
+
+          const rect = await getSpanRectFromText(page, 2, text);
+          const originX = rect.x + rect.width / 2;
+          const originY = rect.y + rect.height / 2;
+
+          await page.evaluate(
+            origin => {
+              window.PDFViewerApplication.pdfViewer.increaseScale({
+                scaleFactor: 2,
+                origin,
+              });
+            },
+            [originX, originY]
+          );
+          const textAfterZoomIn = await getTextAt(page, 2, originX, originY);
+          expect(textAfterZoomIn)
+            .withContext(`In ${browserName}, zoom in`)
+            .toBe(text);
+
+          await page.evaluate(
+            origin => {
+              window.PDFViewerApplication.pdfViewer.decreaseScale({
+                scaleFactor: 0.8,
+                origin,
+              });
+            },
+            [originX, originY]
+          );
+          const textAfterZoomOut = await getTextAt(page, 2, originX, originY);
+          expect(textAfterZoomOut)
+            .withContext(`In ${browserName}, zoom out`)
+            .toBe(text);
+        })
+      );
+    });
+  });
+
   describe("Zoom with the mouse wheel", () => {
     let pages;
 
@@ -83,6 +168,89 @@ describe("PDF viewer", () => {
               .withContext(`In ${browserName}`)
               .toBe(true);
           }
+        })
+      );
+    });
+  });
+
+  describe("CSS-only zoom", () => {
+    let pages;
+
+    beforeAll(async () => {
+      pages = await loadAndWait(
+        "tracemonkey.pdf",
+        ".textLayer .endOfContent",
+        null,
+        null,
+        {
+          maxCanvasPixels: 0,
+        }
+      );
+    });
+
+    afterAll(async () => {
+      await closePages(pages);
+    });
+
+    function createPromiseForFirstPageRendered(page) {
+      return createPromise(page, (resolve, reject) => {
+        const controller = new AbortController();
+        window.PDFViewerApplication.eventBus.on(
+          "pagerendered",
+          ({ pageNumber, timestamp }) => {
+            if (pageNumber === 1) {
+              resolve(timestamp);
+              controller.abort();
+            }
+          },
+          { signal: controller.signal }
+        );
+        setTimeout(reject, 1000, new Error("Timeout"));
+      });
+    }
+
+    it("respects drawing delay when zooming out", async () => {
+      await Promise.all(
+        pages.map(async ([browserName, page]) => {
+          const promise = await createPromiseForFirstPageRendered(page);
+
+          const start = await page.evaluate(() => {
+            const startTime = performance.now();
+            window.PDFViewerApplication.pdfViewer.decreaseScale({
+              drawingDelay: 100,
+              scaleFactor: 0.9,
+            });
+            return startTime;
+          });
+
+          const end = await awaitPromise(promise);
+
+          expect(end - start)
+            .withContext(`In ${browserName}`)
+            .toBeGreaterThanOrEqual(100);
+        })
+      );
+    });
+
+    it("respects drawing delay when zooming in", async () => {
+      await Promise.all(
+        pages.map(async ([browserName, page]) => {
+          const promise = await createPromiseForFirstPageRendered(page);
+
+          const start = await page.evaluate(() => {
+            const startTime = performance.now();
+            window.PDFViewerApplication.pdfViewer.increaseScale({
+              drawingDelay: 100,
+              scaleFactor: 1.1,
+            });
+            return startTime;
+          });
+
+          const end = await awaitPromise(promise);
+
+          expect(end - start)
+            .withContext(`In ${browserName}`)
+            .toBeGreaterThanOrEqual(100);
         })
       );
     });
